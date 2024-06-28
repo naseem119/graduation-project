@@ -34,6 +34,7 @@ output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 # Define the classes for YOLOv4-tiny
 classes = ["person", "animal", "fire", "smoke"]  # Adjust as per your needs
 
+
 def save_frame_locally(frame, frame_count, date_str):
     try:
         os.makedirs(f'frames/{date_str}', exist_ok=True)
@@ -44,6 +45,7 @@ def save_frame_locally(frame, frame_count, date_str):
     except Exception as e:
         logging.error(f"Failed to save frame {frame_count} locally: {e}")
         return None
+
 
 def add_datetime_text(frame):
     now = datetime.datetime.now()
@@ -62,12 +64,14 @@ def add_datetime_text(frame):
                 lineType)
     return frame
 
+
 def create_video_from_frames(date_str, part_number):
     frame_folder = f'frames/{date_str}'
     video_path = f'videos/{date_str}_part{part_number}.mp4'
     os.makedirs('videos', exist_ok=True)
 
-    frame_files = sorted([os.path.abspath(os.path.join(frame_folder, f)) for f in os.listdir(frame_folder) if f.endswith('.jpg')])
+    frame_files = sorted(
+        [os.path.abspath(os.path.join(frame_folder, f)) for f in os.listdir(frame_folder) if f.endswith('.jpg')])
     if not frame_files:
         logging.info(f"No frames found for {date_str}")
         return None
@@ -101,6 +105,7 @@ def create_video_from_frames(date_str, part_number):
         os.remove(frame_list_file)
         return None
 
+
 def upload_to_firebase(local_path, remote_path):
     try:
         blob = bucket.blob(remote_path)
@@ -111,16 +116,22 @@ def upload_to_firebase(local_path, remote_path):
     except Exception as e:
         logging.error(f"Failed to upload {local_path}: {e}")
 
+
 def fetch_frame_from_esp32():
     try:
         with urllib.request.urlopen(ESP32_CAM_URL) as response:
             image_data = response.read()
         image_array = np.frombuffer(image_data, np.uint8)
         frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-        return frame
+        if frame is not None:
+            return frame
+        else:
+            logging.error("Failed to decode image from ESP32")
+            return None
     except Exception as e:
         logging.error(f"Failed to fetch frame from ESP32: {e}")
         return None
+
 
 def detect_objects(frame):
     height, width, channels = frame.shape
@@ -136,7 +147,7 @@ def detect_objects(frame):
             scores = detection[5:]
             class_id = np.argmax(scores)
             confidence = scores[class_id]
-            if confidence > 0.5:
+            if confidence > 0.5 and class_id < len(classes):  # Ensure class_id is within valid range
                 center_x = int(detection[0] * width)
                 center_y = int(detection[1] * height)
                 w = int(detection[2] * width)
@@ -159,6 +170,7 @@ def detect_objects(frame):
 
     return frame, detected_objects
 
+
 def log_event(event_type, date_str, part_number, stream_name, log_file):
     now = datetime.datetime.now()
     event_time = now.strftime("%Y-%m-%d %H:%M:%S")
@@ -167,11 +179,14 @@ def log_event(event_type, date_str, part_number, stream_name, log_file):
     with open(log_file, 'a') as f:
         f.write(log_message)
 
+
 def capture_and_process_frames():
     current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     frame_count = 0
     last_video_creation_time = time.time()
     part_number = 0
+
+    os.makedirs('logs', exist_ok=True)
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = []
@@ -228,13 +243,23 @@ def capture_and_process_frames():
 
     cv2.destroyAllWindows()
 
+
 def handle_video_creation_and_upload(date_str, part_number):
+    logging.info(f"Creating video for {date_str}, part {part_number}")
     video_path = create_video_from_frames(date_str, part_number)
     if video_path:
+        logging.info(f"Uploading video part {part_number} for {date_str} to Firebase")
         upload_to_firebase(video_path, f'camera1/{date_str}/{date_str}_part{part_number}.mp4')
+    else:
+        logging.error(f"Video path not created for {date_str}, part {part_number}")
+
     log_file = f'logs/log_part{part_number}.txt'
     if os.path.exists(log_file):
+        logging.info(f"Uploading log part {part_number} for {date_str} to Firebase")
         upload_to_firebase(log_file, f'camera1_logs/{date_str}_log_part{part_number}.txt')
+    else:
+        logging.error(f"Log file not found for {date_str}, part {part_number}")
+
 
 if __name__ == '__main__':
     logging.info("Starting the stream to Firebase...")
