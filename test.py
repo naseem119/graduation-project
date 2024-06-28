@@ -201,8 +201,7 @@ def capture_and_process_frames():
             frame_count += 1
 
             ret, buffer = cv2.imencode('.jpg', frame)
-            frame = buffer.tobytes()
-            frame_base64 = base64.b64encode(frame).decode('utf-8')
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
             try:
                 db.reference('streams/stream1').set(frame_base64)
                 logging.info(f"Frame {frame_count} pushed to Firebase Realtime Database")
