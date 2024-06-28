@@ -11,6 +11,7 @@ import subprocess
 import logging
 import numpy as np
 import urllib.request
+from io import StringIO
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -171,13 +172,12 @@ def detect_objects(frame):
     return frame, detected_objects
 
 
-def log_event(event_type, date_str, part_number, stream_name, log_file):
+def log_event(event_type, date_str, part_number, stream_name, log_buffer):
     now = datetime.datetime.now()
     event_time = now.strftime("%Y-%m-%d %H:%M:%S")
     log_message = f"Event: {event_type}, Time: {event_time}, Date: {date_str}, Part: {part_number}, Stream: {stream_name}\n"
     logging.info(log_message)
-    with open(log_file, 'a') as f:
-        f.write(log_message)
+    log_buffer.write(log_message)
 
 
 def capture_and_process_frames():
@@ -186,7 +186,7 @@ def capture_and_process_frames():
     last_video_creation_time = time.time()
     part_number = 0
 
-    os.makedirs('logs', exist_ok=True)
+    log_buffer = StringIO()  # Initialize log buffer
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = []
@@ -196,13 +196,11 @@ def capture_and_process_frames():
             if frame is None:
                 continue
 
-            log_file = f'logs/log_part{part_number}.txt'
-
             if frame_count % 10 == 0:
                 frame, detected_objects = detect_objects(frame)
                 if detected_objects:
                     for obj in detected_objects:
-                        log_event(obj, current_date_str, part_number, 'stream1', log_file)
+                        log_event(obj, current_date_str, part_number, 'stream1', log_buffer)
 
             now = datetime.datetime.now()
             date_str = now.strftime("%Y-%m-%d")
@@ -210,6 +208,10 @@ def capture_and_process_frames():
                 current_date_str = date_str
                 frame_count = 0
                 part_number = 0
+
+                # Write the previous log buffer to a file and upload
+                write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number)
+                log_buffer = StringIO()  # Reset log buffer
 
             frame = add_datetime_text(frame)
             frame_path = save_frame_locally(frame, frame_count, current_date_str)
@@ -223,16 +225,9 @@ def capture_and_process_frames():
             except Exception as e:
                 logging.error(f"Error updating Firebase Realtime Database: {e}")
 
-            if isinstance(frame, np.ndarray):
-                cv2.imshow("Frame", frame)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-            else:
-                logging.error(f"Invalid frame type: {type(frame)}")
-
             if time.time() - last_video_creation_time >= 60:
                 last_video_creation_time = time.time()
-                future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number)
+                future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number, log_buffer)
                 futures.append(future)
                 part_number += 1
 
@@ -241,10 +236,16 @@ def capture_and_process_frames():
         for future in as_completed(futures):
             future.result()
 
-    cv2.destroyAllWindows()
+
+def write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number):
+    log_file = f'logs/{date_str}_log_part{part_number}.txt'
+    with open(log_file, 'w') as f:
+        f.write(log_buffer.getvalue())
+    logging.info(f"Log file written for {date_str}, part {part_number}")
+    upload_to_firebase(log_file, f'camera1_logs/{date_str}_log_part{part_number}.txt')
 
 
-def handle_video_creation_and_upload(date_str, part_number):
+def handle_video_creation_and_upload(date_str, part_number, log_buffer):
     logging.info(f"Creating video for {date_str}, part {part_number}")
     video_path = create_video_from_frames(date_str, part_number)
     if video_path:
@@ -253,12 +254,7 @@ def handle_video_creation_and_upload(date_str, part_number):
     else:
         logging.error(f"Video path not created for {date_str}, part {part_number}")
 
-    log_file = f'logs/log_part{part_number}.txt'
-    if os.path.exists(log_file):
-        logging.info(f"Uploading log part {part_number} for {date_str} to Firebase")
-        upload_to_firebase(log_file, f'camera1_logs/{date_str}_log_part{part_number}.txt')
-    else:
-        logging.error(f"Log file not found for {date_str}, part {part_number}")
+    write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number)
 
 
 if __name__ == '__main__':
