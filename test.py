@@ -175,7 +175,7 @@ def detect_objects(frame):
 def log_event(event_type, date_str, part_number, stream_name, log_buffer):
     now = datetime.datetime.now()
     event_time = now.strftime("%Y-%m-%d %H:%M:%S")
-    log_message = f"Event: {event_type}, Time: {event_time}, Date: {date_str}, Part: {part_number}, Stream: {stream_name}\n"
+    log_message = f"{event_type}, {event_time}, {date_str}, {part_number}, {stream_name}\n"
     logging.info(log_message)
     log_buffer.write(log_message)
 
