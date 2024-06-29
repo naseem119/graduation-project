@@ -5,13 +5,13 @@ import datetime
 import time
 import os
 import base64
-import urllib.request
+import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import logging
 import numpy as np
+import urllib.request
 from io import StringIO
-from queue import Queue
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -187,61 +187,52 @@ def capture_and_process_frames(camera_id, url):
     part_number = 0
 
     log_buffer = StringIO()  # Initialize log buffer
-    frame_queue = Queue()  # Queue for frames
 
     with ThreadPoolExecutor(max_workers=5) as executor:
         futures = []
-
         while True:
             start_time = time.time()
+            frame = fetch_frame_from_esp32(url)
+            if frame is None:
+                time.sleep(1)  # Brief sleep to avoid busy loop if frame fetch fails
+                continue
 
-            # Fetch frame asynchronously
-            future_frame = executor.submit(fetch_frame_from_esp32, url)
-            frames = []
-            for future in as_completed([future_frame]):
-                frames.append(future.result())
+            if frame_count % 10 == 0:
+                frame, detected_objects = detect_objects(frame)
+                if detected_objects:
+                    for obj in detected_objects:
+                        log_event(obj, current_date_str, part_number, f'stream{camera_id}', log_buffer)
 
-            if frames:
-                frame = frames[0]
-                if frame is None:
-                    continue
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            if date_str != current_date_str:
+                current_date_str = date_str
+                frame_count = 0
+                part_number = 0
 
-                if frame_count % 10 == 0:
-                    frame, detected_objects = detect_objects(frame)
-                    if detected_objects:
-                        for obj in detected_objects:
-                            log_event(obj, current_date_str, part_number, f'stream{camera_id}', log_buffer)
+                # Write the previous log buffer to a file and upload
+                write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
+                log_buffer = StringIO()  # Reset log buffer
 
-                now = datetime.datetime.now()
-                date_str = now.strftime("%Y-%m-%d")
-                if date_str != current_date_str:
-                    current_date_str = date_str
-                    frame_count = 0
-                    part_number = 0
+            frame = add_datetime_text(frame)
+            frame_path = save_frame_locally(frame, frame_count, current_date_str, camera_id)
+            frame_count += 1
 
-                    # Write the previous log buffer to a file and upload
-                    write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
-                    log_buffer = StringIO()  # Reset log buffer
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            try:
+                db.reference(f'streams/stream{camera_id}').set(frame_base64)
+                logging.info(f"Frame {frame_count} pushed to Firebase Realtime Database")
+            except Exception as e:
+                logging.error(f"Error updating Firebase Realtime Database: {e}")
 
-                frame = add_datetime_text(frame)
-                frame_path = save_frame_locally(frame, frame_count, current_date_str, camera_id)
-                frame_count += 1
+            if time.time() - last_video_creation_time >= 60:
+                last_video_creation_time = time.time()
+                future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id)
+                futures.append(future)
+                part_number += 1
 
-                ret, buffer = cv2.imencode('.jpg', frame)
-                frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                try:
-                    db.reference(f'streams/stream{camera_id}').set(frame_base64)
-                    logging.info(f"Frame {frame_count} pushed to Firebase Realtime Database")
-                except Exception as e:
-                    logging.error(f"Error updating Firebase Realtime Database: {e}")
-
-                if time.time() - last_video_creation_time >= 60:
-                    last_video_creation_time = time.time()
-                    future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id)
-                    futures.append(future)
-                    part_number += 1
-
-                time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
+            time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
 
         for future in as_completed(futures):
             future.result()
