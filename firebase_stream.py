@@ -5,12 +5,11 @@ import datetime
 import time
 import os
 import base64
-import requests
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import logging
 import numpy as np
-import urllib.request
 from io import StringIO
 from queue import Queue
 
@@ -198,11 +197,12 @@ def capture_and_process_frames(camera_id, url):
 
             # Fetch frame asynchronously
             future_frame = executor.submit(fetch_frame_from_esp32, url)
-            futures.append(future_frame)
-            frame_queue.put(future_frame.result())
+            frames = []
+            for future in as_completed([future_frame]):
+                frames.append(future.result())
 
-            if not frame_queue.empty():
-                frame = frame_queue.get()
+            if frames:
+                frame = frames[0]
                 if frame is None:
                     continue
 
