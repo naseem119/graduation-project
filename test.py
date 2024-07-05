@@ -67,7 +67,6 @@ def add_datetime_text(frame):
     return frame
 
 
-
 def create_video_from_frames(date_str, part_number, camera_id):
     frame_folder = f'frames/{camera_id}/{date_str}'
     video_path = f'videos/{camera_id}/{date_str}_part{part_number}.mp4'
