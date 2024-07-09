@@ -6,13 +6,13 @@ import time
 import os
 import base64
 import requests
-from concurrent.futures import ThreadPoolExecutor, as_completed
 import subprocess
 import logging
 import numpy as np
 import urllib.request
 from io import StringIO
 import socket
+from multiprocessing import Pool, Manager, cpu_count
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -251,86 +251,81 @@ def update_realtime_database(camera_id, frame_base64, frame_count):
     except Exception as e:
         logging.error(f"Error updating Firebase Realtime Database: {e}")
 
-def capture_and_process_frames(camera_id, url):
+def capture_and_process_frames(camera_id, url, log_buffers, frame_counts):
     current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    frame_count = 0
+    frame_count = frame_counts[camera_id - 1]
     last_video_creation_time = time.time()
     part_number = 0
 
-    log_buffer = StringIO()  # Initialize log buffer
+    log_buffer = log_buffers[camera_id - 1]  # Use the manager's list for shared state
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        retry_count = 0
-        max_retries = 5
-        while True:
-            try:
-                start_time = time.time()
-                frame = fetch_frame_from_esp32(url)
-                if frame is None:
-                    retry_count += 1
-                    if retry_count > max_retries:
-                        logging.error(f"Max retries reached for camera {camera_id}. Stopping stream.")
-                        break
-                    time.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
-                    continue
+    max_retries = 5
+    retry_count = 0
 
-                retry_count = 0  # Reset retry count on success
+    while True:
+        try:
+            start_time = time.time()
+            frame = fetch_frame_from_esp32(url)
+            if frame is None:
+                retry_count += 1
+                if retry_count > max_retries:
+                    logging.error(f"Max retries reached for camera {camera_id}. Stopping stream.")
+                    break
+                time.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
+                continue
 
-                if frame_count % 5 == 0:
-                    frame, detected_objects = detect_objects(frame)
-                    if detected_objects:
-                        now = datetime.datetime.now()
-                        date_str = now.strftime("%Y-%m-%d")
-                        frame_path = save_frame_locally(frame, frame_count, date_str, camera_id)
-                        if frame_path:
-                            for obj in detected_objects:
-                                log_event(
-                                    event_type=obj,
-                                    date_str=current_date_str,
-                                    part_number=part_number,
-                                    stream_name=f'stream{camera_id}',
-                                    log_buffer=log_buffer,
-                                    frame_path=frame_path,
-                                    camera_id=camera_id
-                                )
+            retry_count = 0  # Reset retry count on success
 
-                now = datetime.datetime.now()
-                date_str = now.strftime("%Y-%m-%d")
-                if date_str != current_date_str:
-                    current_date_str = date_str
-                    frame_count = 0
-                    part_number = 0
+            if frame_count % 5 == 0:
+                frame, detected_objects = detect_objects(frame)
+                if detected_objects:
+                    now = datetime.datetime.now()
+                    date_str = now.strftime("%Y-%m-%d")
+                    frame_path = save_frame_locally(frame, frame_count, date_str, camera_id)
+                    if frame_path:
+                        for obj in detected_objects:
+                            log_event(
+                                event_type=obj,
+                                date_str=current_date_str,
+                                part_number=part_number,
+                                stream_name=f'stream{camera_id}',
+                                log_buffer=log_buffer,
+                                frame_path=frame_path,
+                                camera_id=camera_id
+                            )
 
-                    # Write the previous log buffer to a file and upload
-                    write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
-                    log_buffer = StringIO()  # Reset log buffer
+            now = datetime.datetime.now()
+            date_str = now.strftime("%Y-%m-%d")
+            if date_str != current_date_str:
+                current_date_str = date_str
+                frame_count = 0
+                part_number = 0
 
-                frame = add_datetime_text(frame)
-                frame_path = save_frame_locally(frame, frame_count, current_date_str, camera_id)
-                frame_count += 1
+                # Write the previous log buffer to a file and upload
+                write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
+                log_buffer = StringIO()  # Reset log buffer
 
-                ret, buffer = cv2.imencode('.jpg', frame)
-                frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                update_realtime_database(camera_id, frame_base64, frame_count)  # Update Realtime Database
+            frame = add_datetime_text(frame)
+            frame_path = save_frame_locally(frame, frame_count, current_date_str, camera_id)
+            frame_count += 1
 
-                if time.time() - last_video_creation_time >= 60:
-                    last_video_creation_time = time.time()
-                    future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id)
-                    futures.append(future)
-                    part_number += 1
-                    log_buffer = StringIO()  # Reset log buffer for the new part
+            ret, buffer = cv2.imencode('.jpg', frame)
+            frame_base64 = base64.b64encode(buffer).decode('utf-8')
+            update_realtime_database(camera_id, frame_base64, frame_count)  # Update Realtime Database
 
-                time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
+            if time.time() - last_video_creation_time >= 60:
+                last_video_creation_time = time.time()
+                handle_video_creation_and_upload(current_date_str, part_number, log_buffer, camera_id)
+                part_number += 1
+                log_buffer = StringIO()  # Reset log buffer for the new part
 
-            except Exception as e:
-                logging.error(f"Error in capture and process loop for camera {camera_id}: {e}")
+            time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
 
-        for future in as_completed(futures):
-            future.result()
+        except Exception as e:
+            logging.error(f"Error in capture and process loop for camera {camera_id}: {e}")
 
-        # Write the final log buffer to a file and upload
-        write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
+    # Write the final log buffer to a file and upload
+    write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
 
 def write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id):
     log_file = f'logs/{camera_id}/{date_str}_log_part{part_number}.txt'
@@ -351,7 +346,7 @@ def handle_video_creation_and_upload(date_str, part_number, log_buffer, camera_i
 
     write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id)
 
-def receive_mq2_data():
+def receive_mq2_data(log_buffers):
     UDP_PORT = 12345
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0', UDP_PORT))
@@ -364,16 +359,20 @@ def receive_mq2_data():
         if sensor_value > 500:
             current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
             part_number = 0  # Assuming part number can be set to 0 or fetched based on your application logic
-            log_buffer = StringIO()  # Temporary log buffer for this event
+            log_buffer = log_buffers[0]  # Use the first log buffer for MQ2 sensor events
             log_event("smoke", current_date_str, part_number, "MQ2_sensor", log_buffer, None, "MQ2_sensor")  # No frame path for MQ2 sensor
             write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, "MQ2_sensor")
 
 if __name__ == '__main__':
     logging.info("Starting the streams to Firebase...")
-    with ThreadPoolExecutor(max_workers=len(ESP32_CAM_URLS) + 1) as executor:
-        futures = []
-        futures.append(executor.submit(receive_mq2_data))
+
+    manager = Manager()
+    log_buffers = manager.list([StringIO() for _ in range(len(ESP32_CAM_URLS) + 1)])
+    frame_counts = manager.list([0 for _ in range(len(ESP32_CAM_URLS))])
+
+    with Pool(processes=cpu_count()) as pool:
+        pool.apply_async(receive_mq2_data, args=(log_buffers,))
         for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
-            futures.append(executor.submit(capture_and_process_frames, camera_id, url))
-        for future in as_completed(futures):
-            future.result()
+            pool.apply_async(capture_and_process_frames, args=(camera_id, url, log_buffers, frame_counts))
+        pool.close()
+        pool.join()
