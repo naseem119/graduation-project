@@ -13,8 +13,6 @@ import numpy as np
 import urllib.request
 from io import StringIO
 import socket
-import aiohttp
-import asyncio
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -34,7 +32,7 @@ firestore_db = firestore.client()
 realtime_db = db.reference()  # Set the root reference for the Realtime Database
 
 ESP32_CAM_URLS = ["http://192.168.1.132/", "http://192.168.1.133/"]
-FRAME_RATE = 10  # Increase frame rate for faster processing
+FRAME_RATE = 10  # Increased frame rate
 
 # Load YOLOv4-tiny model
 net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
@@ -122,10 +120,10 @@ def upload_to_firebase(local_path, remote_path):
     except Exception as e:
         logging.error(f"Failed to upload {local_path}: {e}")
 
-async def fetch_frame_from_esp32(session, url):
+def fetch_frame_from_esp32(url):
     try:
-        async with session.get(url, timeout=10) as response:
-            image_data = await response.read()
+        with urllib.request.urlopen(url, timeout=5) as response:
+            image_data = response.read()
         image_array = np.frombuffer(image_data, np.uint8)
         frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
         if frame is not None:
@@ -253,7 +251,7 @@ def update_realtime_database(camera_id, frame_base64, frame_count):
     except Exception as e:
         logging.error(f"Error updating Firebase Realtime Database: {e}")
 
-async def capture_and_process_frames(camera_id, url):
+def capture_and_process_frames(camera_id, url):
     current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     frame_count = 0
     last_video_creation_time = time.time()
@@ -261,25 +259,25 @@ async def capture_and_process_frames(camera_id, url):
 
     log_buffer = StringIO()  # Initialize log buffer
 
-    retry_count = 0
-    max_retries = 5
-
-    async with aiohttp.ClientSession() as session:
+    with ThreadPoolExecutor(max_workers=10) as executor:  # Increase number of workers
+        futures = []
+        retry_count = 0
+        max_retries = 3  # Reduced retries for quicker failure handling
         while True:
             try:
                 start_time = time.time()
-                frame = await fetch_frame_from_esp32(session, url)
+                frame = fetch_frame_from_esp32(url)
                 if frame is None:
                     retry_count += 1
                     if retry_count > max_retries:
                         logging.error(f"Max retries reached for camera {camera_id}. Stopping stream.")
                         break
-                    await asyncio.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
+                    time.sleep(0.1)  # Brief sleep to avoid busy loop if frame fetch fails
                     continue
 
                 retry_count = 0  # Reset retry count on success
 
-                if frame_count % 20 == 0:  # Perform object detection less frequently
+                if frame_count % 5 == 0:
                     frame, detected_objects = detect_objects(frame)
                     if detected_objects:
                         now = datetime.datetime.now()
@@ -318,16 +316,18 @@ async def capture_and_process_frames(camera_id, url):
 
                 if time.time() - last_video_creation_time >= 60:
                     last_video_creation_time = time.time()
-                    await asyncio.get_event_loop().run_in_executor(
-                        None, handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id
-                    )
+                    future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id)
+                    futures.append(future)
                     part_number += 1
                     log_buffer = StringIO()  # Reset log buffer for the new part
 
-                await asyncio.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
+                time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
 
             except Exception as e:
                 logging.error(f"Error in capture and process loop for camera {camera_id}: {e}")
+
+        for future in as_completed(futures):
+            future.result()
 
         # Write the final log buffer to a file and upload
         write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
@@ -368,15 +368,12 @@ def receive_mq2_data():
             log_event("smoke", current_date_str, part_number, "MQ2_sensor", log_buffer, None, "MQ2_sensor")  # No frame path for MQ2 sensor
             write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, "MQ2_sensor")
 
-async def main():
+if __name__ == '__main__':
     logging.info("Starting the streams to Firebase...")
-    with ThreadPoolExecutor(max_workers=len(ESP32_CAM_URLS) + 1) as executor:
+    with ThreadPoolExecutor(max_workers=len(ESP32_CAM_URLS) + 2) as executor:  # Increase number of workers
         futures = []
         futures.append(executor.submit(receive_mq2_data))
-        loop = asyncio.get_event_loop()
         for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
-            futures.append(loop.run_in_executor(executor, capture_and_process_frames, camera_id, url))
-        await asyncio.gather(*futures)
-
-if __name__ == '__main__':
-    asyncio.run(main())
+            futures.append(executor.submit(capture_and_process_frames, camera_id, url))
+        for future in as_completed(futures):
+            future.result()
