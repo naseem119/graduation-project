@@ -1,18 +1,17 @@
+import asyncio
+import aiohttp
 import cv2
 import firebase_admin
-from firebase_admin import credentials, storage, db, firestore, messaging
+from firebase_admin import credentials, storage, firestore, messaging
 import datetime
-import time
 import os
 import base64
-import requests
-import subprocess
 import logging
 import numpy as np
-import urllib.request
+import subprocess
 from io import StringIO
 import socket
-from multiprocessing import Pool, Manager, cpu_count
+from multiprocessing import Process, Manager, cpu_count
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -28,11 +27,10 @@ bucket = storage.bucket()
 # Initialize Firestore
 firestore_db = firestore.client()
 
-# Initialize Realtime Database
-realtime_db = db.reference()  # Set the root reference for the Realtime Database
-
+# Define constants
 ESP32_CAM_URLS = ["http://192.168.1.132/", "http://192.168.1.133/"]
 FRAME_RATE = 2  # Set consistent frame rate for capturing frames
+BATCH_SIZE = 10  # Number of frames to process in each batch
 
 # Load YOLOv4-tiny model
 net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
@@ -41,6 +39,27 @@ output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 
 # Define the classes for YOLOv4-tiny
 classes = ["person", "animal", "fire", "smoke"]  # Adjust as per your needs
+
+async def fetch_frame(session, url):
+    try:
+        async with session.get(url, timeout=10) as response:
+            if response.status == 200:
+                image_data = await response.read()
+                image_array = np.frombuffer(image_data, np.uint8)
+                frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+                if frame is not None:
+                    return frame
+                else:
+                    logging.error("Failed to decode image from ESP32")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to fetch frame from ESP32: {e}")
+        return None
+
+async def fetch_frames(urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [fetch_frame(session, url) for url in urls]
+        return await asyncio.gather(*tasks)
 
 def save_frame_locally(frame, frame_count, date_str, camera_id):
     try:
@@ -119,21 +138,6 @@ def upload_to_firebase(local_path, remote_path):
         logging.info(f"{local_path} deleted after upload")
     except Exception as e:
         logging.error(f"Failed to upload {local_path}: {e}")
-
-def fetch_frame_from_esp32(url):
-    try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            image_data = response.read()
-        image_array = np.frombuffer(image_data, np.uint8)
-        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-        if frame is not None:
-            return frame
-        else:
-            logging.error("Failed to decode image from ESP32")
-            return None
-    except Exception as e:
-        logging.error(f"Failed to fetch frame from ESP32: {e}")
-        return None
 
 def detect_objects(frame):
     height, width, channels = frame.shape
@@ -246,7 +250,7 @@ def log_event(event_type, date_str, part_number, stream_name, log_buffer, frame_
 
 def update_realtime_database(camera_id, frame_base64, frame_count):
     try:
-        realtime_db.child(f'streams/stream{camera_id}').set(frame_base64)
+        db.reference(f'streams/stream{camera_id}').set(frame_base64)
         logging.info(f"Frame {frame_count} pushed to Firebase Realtime Database")
     except Exception as e:
         logging.error(f"Error updating Firebase Realtime Database: {e}")
@@ -265,8 +269,8 @@ def capture_and_process_frames(camera_id, url, log_buffers, frame_counts):
     while True:
         try:
             start_time = time.time()
-            frame = fetch_frame_from_esp32(url)
-            if frame is None:
+            frames = asyncio.run(fetch_frames([url]))
+            if not frames or frames[0] is None:
                 retry_count += 1
                 if retry_count > max_retries:
                     logging.error(f"Max retries reached for camera {camera_id}. Stopping stream.")
@@ -274,6 +278,7 @@ def capture_and_process_frames(camera_id, url, log_buffers, frame_counts):
                 time.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
                 continue
 
+            frame = frames[0]
             retry_count = 0  # Reset retry count on success
 
             if frame_count % 5 == 0:
@@ -370,9 +375,14 @@ if __name__ == '__main__':
     log_buffers = manager.list([StringIO() for _ in range(len(ESP32_CAM_URLS) + 1)])
     frame_counts = manager.list([0 for _ in range(len(ESP32_CAM_URLS))])
 
-    with Pool(processes=cpu_count()) as pool:
-        pool.apply_async(receive_mq2_data, args=(log_buffers,))
-        for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
-            pool.apply_async(capture_and_process_frames, args=(camera_id, url, log_buffers, frame_counts))
-        pool.close()
-        pool.join()
+    processes = []
+    processes.append(Process(target=receive_mq2_data, args=(log_buffers,)))
+    for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
+        p = Process(target=capture_and_process_frames, args=(camera_id, url, log_buffers, frame_counts))
+        processes.append(p)
+
+    for p in processes:
+        p.start()
+
+    for p in processes:
+        p.join()
