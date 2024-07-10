@@ -1,17 +1,20 @@
-import asyncio
-import aiohttp
 import cv2
 import firebase_admin
-from firebase_admin import credentials, storage, firestore, messaging
+from firebase_admin import credentials, storage, db, firestore, messaging
 import datetime
+import time
 import os
 import base64
+import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import subprocess
 import logging
 import numpy as np
-import subprocess
+import urllib.request
 from io import StringIO
 import socket
-from multiprocessing import Process, Manager, cpu_count
+import asyncio
+import aiofiles
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -27,10 +30,11 @@ bucket = storage.bucket()
 # Initialize Firestore
 firestore_db = firestore.client()
 
-# Define constants
+# Initialize Realtime Database
+realtime_db = db.reference()  # Set the root reference for the Realtime Database
+
 ESP32_CAM_URLS = ["http://192.168.1.132/", "http://192.168.1.133/"]
 FRAME_RATE = 2  # Set consistent frame rate for capturing frames
-BATCH_SIZE = 10  # Number of frames to process in each batch
 
 # Load YOLOv4-tiny model
 net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
@@ -40,28 +44,7 @@ output_layers = [layer_names[i - 1] for i in net.getUnconnectedOutLayers()]
 # Define the classes for YOLOv4-tiny
 classes = ["person", "animal", "fire", "smoke"]  # Adjust as per your needs
 
-async def fetch_frame(session, url):
-    try:
-        async with session.get(url, timeout=10) as response:
-            if response.status == 200:
-                image_data = await response.read()
-                image_array = np.frombuffer(image_data, np.uint8)
-                frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
-                if frame is not None:
-                    return frame
-                else:
-                    logging.error("Failed to decode image from ESP32")
-            return None
-    except Exception as e:
-        logging.error(f"Failed to fetch frame from ESP32: {e}")
-        return None
-
-async def fetch_frames(urls):
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_frame(session, url) for url in urls]
-        return await asyncio.gather(*tasks)
-
-def save_frame_locally(frame, frame_count, date_str, camera_id):
+async def save_frame_locally(frame, frame_count, date_str, camera_id):
     try:
         os.makedirs(f'frames/{camera_id}/{date_str}', exist_ok=True)
         frame_path = os.path.abspath(f'frames/{camera_id}/{date_str}/frame_{frame_count:06d}.jpg')
@@ -89,7 +72,7 @@ def add_datetime_text(frame):
                 lineType)
     return frame
 
-def create_video_from_frames(date_str, part_number, camera_id):
+async def create_video_from_frames(date_str, part_number, camera_id):
     frame_folder = f'frames/{camera_id}/{date_str}'
     video_path = f'videos/{camera_id}/{date_str}_part{part_number}.mp4'
     os.makedirs(f'videos/{camera_id}', exist_ok=True)
@@ -101,9 +84,9 @@ def create_video_from_frames(date_str, part_number, camera_id):
         return None
 
     frame_list_file = os.path.abspath(f'{frame_folder}/frame_list_{part_number}.txt')
-    with open(frame_list_file, 'w') as f:
+    async with aiofiles.open(frame_list_file, 'w') as f:
         for frame_file in frame_files:
-            f.write(f"file '{frame_file}'\n")
+            await f.write(f"file '{frame_file}'\n")
     logging.info(f"Frame list created at {frame_list_file}")
 
     cmd = [
@@ -129,7 +112,7 @@ def create_video_from_frames(date_str, part_number, camera_id):
         os.remove(frame_list_file)
         return None
 
-def upload_to_firebase(local_path, remote_path):
+async def upload_to_firebase(local_path, remote_path):
     try:
         blob = bucket.blob(remote_path)
         blob.upload_from_filename(local_path)
@@ -138,6 +121,22 @@ def upload_to_firebase(local_path, remote_path):
         logging.info(f"{local_path} deleted after upload")
     except Exception as e:
         logging.error(f"Failed to upload {local_path}: {e}")
+
+async def fetch_frame_from_esp32(url):
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=10) as response:
+                image_data = await response.read()
+        image_array = np.frombuffer(image_data, np.uint8)
+        frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
+        if frame is not None:
+            return frame
+        else:
+            logging.error("Failed to decode image from ESP32")
+            return None
+    except Exception as e:
+        logging.error(f"Failed to fetch frame from ESP32: {e}")
+        return None
 
 def detect_objects(frame):
     height, width, channels = frame.shape
@@ -176,7 +175,7 @@ def detect_objects(frame):
 
     return frame, detected_objects
 
-def upload_frame_to_firebase(frame_path, camera_id, event_time):
+async def upload_frame_to_firebase(frame_path, camera_id, event_time):
     try:
         blob = bucket.blob(f'event_frames/{camera_id}/{event_time}.jpg')
         blob.upload_from_filename(frame_path)
@@ -223,7 +222,7 @@ def log_event_to_firestore(event_type, event_time, camera_id, part_number):
     except Exception as e:
         logging.error(f"Failed to log event to Firestore: {e}")
 
-def log_event(event_type, date_str, part_number, stream_name, log_buffer, frame_path, camera_id):
+async def log_event(event_type, date_str, part_number, stream_name, log_buffer, frame_path, camera_id):
     now = datetime.datetime.now()
     event_time = now.strftime("%Y-%m-%d %H:%M:%S")
     log_message = f"{event_type}, {event_time}, {date_str}, {part_number}, {stream_name}\n"
@@ -231,7 +230,7 @@ def log_event(event_type, date_str, part_number, stream_name, log_buffer, frame_
     log_buffer.write(log_message)
     
     # Upload the frame to Firebase and get the URL
-    frame_url = upload_frame_to_firebase(frame_path, camera_id, event_time)
+    frame_url = await upload_frame_to_firebase(frame_path, camera_id, event_time)
 
     # Log event to Firestore
     log_event_to_firestore(event_type, event_time, camera_id, part_number)
@@ -248,37 +247,35 @@ def log_event(event_type, date_str, part_number, stream_name, log_buffer, frame_
             event_type=event_type
         )
 
-def update_realtime_database(camera_id, frame_base64, frame_count):
+async def update_realtime_database(camera_id, frame_base64, frame_count):
     try:
-        db.reference(f'streams/stream{camera_id}').set(frame_base64)
+        realtime_db.child(f'streams/stream{camera_id}').set(frame_base64)
         logging.info(f"Frame {frame_count} pushed to Firebase Realtime Database")
     except Exception as e:
         logging.error(f"Error updating Firebase Realtime Database: {e}")
 
-def capture_and_process_frames(camera_id, url, log_buffers, frame_counts):
+async def capture_and_process_frames(camera_id, url):
     current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-    frame_count = frame_counts[camera_id - 1]
+    frame_count = 0
     last_video_creation_time = time.time()
     part_number = 0
 
-    log_buffer = log_buffers[camera_id - 1]  # Use the manager's list for shared state
+    log_buffer = StringIO()  # Initialize log buffer
 
-    max_retries = 5
     retry_count = 0
-
+    max_retries = 5
     while True:
         try:
             start_time = time.time()
-            frames = asyncio.run(fetch_frames([url]))
-            if not frames or frames[0] is None:
+            frame = await fetch_frame_from_esp32(url)
+            if frame is None:
                 retry_count += 1
                 if retry_count > max_retries:
                     logging.error(f"Max retries reached for camera {camera_id}. Stopping stream.")
                     break
-                time.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
+                await asyncio.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
                 continue
 
-            frame = frames[0]
             retry_count = 0  # Reset retry count on success
 
             if frame_count % 5 == 0:
@@ -286,10 +283,10 @@ def capture_and_process_frames(camera_id, url, log_buffers, frame_counts):
                 if detected_objects:
                     now = datetime.datetime.now()
                     date_str = now.strftime("%Y-%m-%d")
-                    frame_path = save_frame_locally(frame, frame_count, date_str, camera_id)
+                    frame_path = await save_frame_locally(frame, frame_count, date_str, camera_id)
                     if frame_path:
                         for obj in detected_objects:
-                            log_event(
+                            await log_event(
                                 event_type=obj,
                                 date_str=current_date_str,
                                 part_number=part_number,
@@ -307,51 +304,48 @@ def capture_and_process_frames(camera_id, url, log_buffers, frame_counts):
                 part_number = 0
 
                 # Write the previous log buffer to a file and upload
-                write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
+                await write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
                 log_buffer = StringIO()  # Reset log buffer
 
             frame = add_datetime_text(frame)
-            frame_path = save_frame_locally(frame, frame_count, current_date_str, camera_id)
+            frame_path = await save_frame_locally(frame, frame_count, current_date_str, camera_id)
             frame_count += 1
 
             ret, buffer = cv2.imencode('.jpg', frame)
             frame_base64 = base64.b64encode(buffer).decode('utf-8')
-            update_realtime_database(camera_id, frame_base64, frame_count)  # Update Realtime Database
+            await update_realtime_database(camera_id, frame_base64, frame_count)  # Update Realtime Database
 
             if time.time() - last_video_creation_time >= 60:
                 last_video_creation_time = time.time()
-                handle_video_creation_and_upload(current_date_str, part_number, log_buffer, camera_id)
+                await handle_video_creation_and_upload(current_date_str, part_number, log_buffer, camera_id)
                 part_number += 1
                 log_buffer = StringIO()  # Reset log buffer for the new part
 
-            time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
+            await asyncio.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
 
         except Exception as e:
             logging.error(f"Error in capture and process loop for camera {camera_id}: {e}")
 
-    # Write the final log buffer to a file and upload
-    write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
-
-def write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id):
+async def write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id):
     log_file = f'logs/{camera_id}/{date_str}_log_part{part_number}.txt'
     os.makedirs(f'logs/{camera_id}', exist_ok=True)
-    with open(log_file, 'w') as f:
-        f.write(log_buffer.getvalue())
+    async with aiofiles.open(log_file, 'w') as f:
+        await f.write(log_buffer.getvalue())
     logging.info(f"Log file written for {date_str}, part {part_number}")
-    upload_to_firebase(log_file, f'camera{camera_id}_logs/{date_str}/{date_str}_log_part{part_number}.txt')
+    await upload_to_firebase(log_file, f'camera{camera_id}_logs/{date_str}/{date_str}_log_part{part_number}.txt')
 
-def handle_video_creation_and_upload(date_str, part_number, log_buffer, camera_id):
+async def handle_video_creation_and_upload(date_str, part_number, log_buffer, camera_id):
     logging.info(f"Creating video for {date_str}, part {part_number}")
-    video_path = create_video_from_frames(date_str, part_number, camera_id)
+    video_path = await create_video_from_frames(date_str, part_number, camera_id)
     if video_path:
         logging.info(f"Uploading video part {part_number} for {date_str} to Firebase")
-        upload_to_firebase(video_path, f'camera{camera_id}/{date_str}/{date_str}_part{part_number}.mp4')
+        await upload_to_firebase(video_path, f'camera{camera_id}/{date_str}/{date_str}_part{part_number}.mp4')
     else:
         logging.error(f"Video path not created for {date_str}, part {part_number}")
 
-    write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id)
+    await write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id)
 
-def receive_mq2_data(log_buffers):
+async def receive_mq2_data():
     UDP_PORT = 12345
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.bind(('0.0.0.0', UDP_PORT))
@@ -364,25 +358,16 @@ def receive_mq2_data(log_buffers):
         if sensor_value > 500:
             current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
             part_number = 0  # Assuming part number can be set to 0 or fetched based on your application logic
-            log_buffer = log_buffers[0]  # Use the first log buffer for MQ2 sensor events
-            log_event("smoke", current_date_str, part_number, "MQ2_sensor", log_buffer, None, "MQ2_sensor")  # No frame path for MQ2 sensor
-            write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, "MQ2_sensor")
+            log_buffer = StringIO()  # Temporary log buffer for this event
+            await log_event("smoke", current_date_str, part_number, "MQ2_sensor", log_buffer, None, "MQ2_sensor")  # No frame path for MQ2 sensor
+            await write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, "MQ2_sensor")
+
+async def main():
+    logging.info("Starting the streams to Firebase...")
+    tasks = [receive_mq2_data()]
+    for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
+        tasks.append(capture_and_process_frames(camera_id, url))
+    await asyncio.gather(*tasks)
 
 if __name__ == '__main__':
-    logging.info("Starting the streams to Firebase...")
-
-    manager = Manager()
-    log_buffers = manager.list([StringIO() for _ in range(len(ESP32_CAM_URLS) + 1)])
-    frame_counts = manager.list([0 for _ in range(len(ESP32_CAM_URLS))])
-
-    processes = []
-    processes.append(Process(target=receive_mq2_data, args=(log_buffers,)))
-    for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
-        p = Process(target=capture_and_process_frames, args=(camera_id, url, log_buffers, frame_counts))
-        processes.append(p)
-
-    for p in processes:
-        p.start()
-
-    for p in processes:
-        p.join()
+    asyncio.run(main())
