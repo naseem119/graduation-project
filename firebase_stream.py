@@ -13,6 +13,8 @@ import numpy as np
 import urllib.request
 from io import StringIO
 import socket
+import aiohttp
+import asyncio
 
 # Initialize logging
 logging.basicConfig(level=logging.DEBUG, format='%(asctime)s - %(levelname)s - %(message)s')
@@ -32,7 +34,7 @@ firestore_db = firestore.client()
 realtime_db = db.reference()  # Set the root reference for the Realtime Database
 
 ESP32_CAM_URLS = ["http://192.168.1.132/", "http://192.168.1.133/"]
-FRAME_RATE = 2  # Set consistent frame rate for capturing frames
+FRAME_RATE = 10  # Increase frame rate for faster processing
 
 # Load YOLOv4-tiny model
 net = cv2.dnn.readNet("yolov4-tiny.weights", "yolov4-tiny.cfg")
@@ -45,8 +47,9 @@ classes = ["person", "animal", "fire", "smoke"]  # Adjust as per your needs
 def save_frame_locally(frame, frame_count, date_str, camera_id):
     try:
         os.makedirs(f'frames/{camera_id}/{date_str}', exist_ok=True)
-        frame_path = f'frames/{camera_id}/{date_str}/frame_{frame_count:06d}.jpg'
+        frame_path = os.path.abspath(f'frames/{camera_id}/{date_str}/frame_{frame_count:06d}.jpg')
         cv2.imwrite(frame_path, frame)
+        logging.info(f"Frame {frame_count} saved locally at {frame_path}")
         return frame_path
     except Exception as e:
         logging.error(f"Failed to save frame {frame_count} locally: {e}")
@@ -55,7 +58,18 @@ def save_frame_locally(frame, frame_count, date_str, camera_id):
 def add_datetime_text(frame):
     now = datetime.datetime.now()
     date_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-    cv2.putText(frame, date_time_str, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
+    font = cv2.FONT_HERSHEY_SIMPLEX
+    bottomLeftCornerOfText = (10, 30)
+    fontScale = 1
+    fontColor = (255, 255, 255)
+    lineType = 2
+
+    cv2.putText(frame, date_time_str,
+                bottomLeftCornerOfText,
+                font,
+                fontScale,
+                fontColor,
+                lineType)
     return frame
 
 def create_video_from_frames(date_str, part_number, camera_id):
@@ -64,13 +78,12 @@ def create_video_from_frames(date_str, part_number, camera_id):
     os.makedirs(f'videos/{camera_id}', exist_ok=True)
 
     frame_files = sorted(
-        [os.path.join(frame_folder, f) for f in os.listdir(frame_folder) if f.endswith('.jpg')]
-    )
+        [os.path.abspath(os.path.join(frame_folder, f)) for f in os.listdir(frame_folder) if f.endswith('.jpg')])
     if not frame_files:
         logging.info(f"No frames found for {date_str}")
         return None
 
-    frame_list_file = f'{frame_folder}/frame_list_{part_number}.txt'
+    frame_list_file = os.path.abspath(f'{frame_folder}/frame_list_{part_number}.txt')
     with open(frame_list_file, 'w') as f:
         for frame_file in frame_files:
             f.write(f"file '{frame_file}'\n")
@@ -87,6 +100,7 @@ def create_video_from_frames(date_str, part_number, camera_id):
     if os.path.exists(video_path):
         logging.info(f"Video created for {date_str} at {video_path}")
 
+        # Clean up frames and frame list after creating video
         for frame_file in frame_files:
             os.remove(frame_file)
         os.remove(frame_list_file)
@@ -108,10 +122,10 @@ def upload_to_firebase(local_path, remote_path):
     except Exception as e:
         logging.error(f"Failed to upload {local_path}: {e}")
 
-def fetch_frame_from_esp32(url):
+async def fetch_frame_from_esp32(session, url):
     try:
-        with urllib.request.urlopen(url, timeout=10) as response:
-            image_data = response.read()
+        async with session.get(url, timeout=10) as response:
+            image_data = await response.read()
         image_array = np.frombuffer(image_data, np.uint8)
         frame = cv2.imdecode(image_array, cv2.IMREAD_COLOR)
         if frame is not None:
@@ -124,21 +138,26 @@ def fetch_frame_from_esp32(url):
         return None
 
 def detect_objects(frame):
-    height, width, _ = frame.shape
+    height, width, channels = frame.shape
     blob = cv2.dnn.blobFromImage(frame, 0.00392, (416, 416), (0, 0, 0), True, crop=False)
     net.setInput(blob)
     outs = net.forward(output_layers)
-    class_ids, confidences, boxes = [], [], []
+    class_ids = []
+    confidences = []
+    boxes = []
 
     for out in outs:
         for detection in out:
             scores = detection[5:]
             class_id = np.argmax(scores)
             confidence = scores[class_id]
-            if confidence > 0.5 and class_id < len(classes):
-                center_x, center_y = int(detection[0] * width), int(detection[1] * height)
-                w, h = int(detection[2] * width), int(detection[3] * height)
-                x, y = int(center_x - w / 2), int(center_y - h / 2)
+            if confidence > 0.5 and class_id < len(classes):  # Ensure class_id is within valid range
+                center_x = int(detection[0] * width)
+                center_y = int(detection[1] * height)
+                w = int(detection[2] * width)
+                h = int(detection[3] * height)
+                x = int(center_x - w / 2)
+                y = int(center_y - h / 2)
                 boxes.append([x, y, w, h])
                 confidences.append(float(confidence))
                 class_ids.append(class_id)
@@ -160,6 +179,7 @@ def upload_frame_to_firebase(frame_path, camera_id, event_time):
         blob = bucket.blob(f'event_frames/{camera_id}/{event_time}.jpg')
         blob.upload_from_filename(frame_path)
 
+        # Generate a signed URL for the blob, valid for 1 hour
         url = blob.generate_signed_url(expiration=datetime.timedelta(hours=1), method='GET')
         logging.info(f"Frame {frame_path} uploaded to Firebase Storage at {url}")
         return url
@@ -169,12 +189,15 @@ def upload_frame_to_firebase(frame_path, camera_id, event_time):
 
 def send_notification(title, body, frame_url, event_time, camera_id, part_number, event_type, topic="all"):
     message = messaging.Message(
-        notification=messaging.Notification(title=title, body=body),
+        notification=messaging.Notification(
+            title=title,
+            body=body,
+        ),
         data={
-            "frame_url": frame_url,
-            "event_time": event_time,
+            "frame_url": str(frame_url),
+            "event_time": str(event_time),
             "camera_id": str(camera_id),
-            "event_type": event_type,
+            "event_type": str(event_type),
             "part_id": str(part_number)
         },
         topic=topic,
@@ -192,7 +215,7 @@ def log_event_to_firestore(event_type, event_time, camera_id, part_number):
             'eventType': event_type,
             'eventTime': event_time,
             'cameraId': camera_id,
-            'partNumber': str(part_number),
+            'partNumber': str(part_number),  # Ensure partNumber is stored as a string
         })
         logging.info(f"Event logged to Firestore: {event_type} at {event_time} on Camera {camera_id}, part {part_number}")
     except Exception as e:
@@ -205,10 +228,13 @@ def log_event(event_type, date_str, part_number, stream_name, log_buffer, frame_
     logging.info(log_message)
     log_buffer.write(log_message)
     
+    # Upload the frame to Firebase and get the URL
     frame_url = upload_frame_to_firebase(frame_path, camera_id, event_time)
 
+    # Log event to Firestore
     log_event_to_firestore(event_type, event_time, camera_id, part_number)
 
+    # Send notification with frame URL
     if event_type in ["fire", "smoke", "person"]:
         send_notification(
             title=f"{event_type} detected at {event_time} on Camera {camera_id}",
@@ -227,33 +253,33 @@ def update_realtime_database(camera_id, frame_base64, frame_count):
     except Exception as e:
         logging.error(f"Error updating Firebase Realtime Database: {e}")
 
-def capture_and_process_frames(camera_id, url):
+async def capture_and_process_frames(camera_id, url):
     current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
     frame_count = 0
     last_video_creation_time = time.time()
     part_number = 0
 
-    log_buffer = StringIO()
+    log_buffer = StringIO()  # Initialize log buffer
 
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        futures = []
-        retry_count = 0
-        max_retries = 5
+    retry_count = 0
+    max_retries = 5
+
+    async with aiohttp.ClientSession() as session:
         while True:
             try:
                 start_time = time.time()
-                frame = fetch_frame_from_esp32(url)
+                frame = await fetch_frame_from_esp32(session, url)
                 if frame is None:
                     retry_count += 1
                     if retry_count > max_retries:
                         logging.error(f"Max retries reached for camera {camera_id}. Stopping stream.")
                         break
-                    time.sleep(2)
+                    await asyncio.sleep(2)  # Brief sleep to avoid busy loop if frame fetch fails
                     continue
 
-                retry_count = 0
+                retry_count = 0  # Reset retry count on success
 
-                if frame_count % 5 == 0:
+                if frame_count % 20 == 0:  # Perform object detection less frequently
                     frame, detected_objects = detect_objects(frame)
                     if detected_objects:
                         now = datetime.datetime.now()
@@ -278,8 +304,9 @@ def capture_and_process_frames(camera_id, url):
                     frame_count = 0
                     part_number = 0
 
+                    # Write the previous log buffer to a file and upload
                     write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
-                    log_buffer = StringIO()
+                    log_buffer = StringIO()  # Reset log buffer
 
                 frame = add_datetime_text(frame)
                 frame_path = save_frame_locally(frame, frame_count, current_date_str, camera_id)
@@ -287,23 +314,22 @@ def capture_and_process_frames(camera_id, url):
 
                 ret, buffer = cv2.imencode('.jpg', frame)
                 frame_base64 = base64.b64encode(buffer).decode('utf-8')
-                update_realtime_database(camera_id, frame_base64, frame_count)
+                update_realtime_database(camera_id, frame_base64, frame_count)  # Update Realtime Database
 
                 if time.time() - last_video_creation_time >= 60:
                     last_video_creation_time = time.time()
-                    future = executor.submit(handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id)
-                    futures.append(future)
+                    await asyncio.get_event_loop().run_in_executor(
+                        None, handle_video_creation_and_upload, current_date_str, part_number, log_buffer, camera_id
+                    )
                     part_number += 1
-                    log_buffer = StringIO()
+                    log_buffer = StringIO()  # Reset log buffer for the new part
 
-                time.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))
+                await asyncio.sleep(max(0, (1 / FRAME_RATE) - (time.time() - start_time)))  # Ensure consistent frame rate
 
             except Exception as e:
                 logging.error(f"Error in capture and process loop for camera {camera_id}: {e}")
 
-        for future in as_completed(futures):
-            future.result()
-
+        # Write the final log buffer to a file and upload
         write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, camera_id)
 
 def write_log_buffer_to_file_and_upload(log_buffer, date_str, part_number, camera_id):
@@ -337,17 +363,20 @@ def receive_mq2_data():
         logging.info(f"Received data from {addr}: {sensor_value}")
         if sensor_value > 500:
             current_date_str = datetime.datetime.now().strftime("%Y-%m-%d")
-            part_number = 0
-            log_buffer = StringIO()
-            log_event("smoke", current_date_str, part_number, "MQ2_sensor", log_buffer, None, "MQ2_sensor")
+            part_number = 0  # Assuming part number can be set to 0 or fetched based on your application logic
+            log_buffer = StringIO()  # Temporary log buffer for this event
+            log_event("smoke", current_date_str, part_number, "MQ2_sensor", log_buffer, None, "MQ2_sensor")  # No frame path for MQ2 sensor
             write_log_buffer_to_file_and_upload(log_buffer, current_date_str, part_number, "MQ2_sensor")
 
-if __name__ == '__main__':
+async def main():
     logging.info("Starting the streams to Firebase...")
     with ThreadPoolExecutor(max_workers=len(ESP32_CAM_URLS) + 1) as executor:
         futures = []
         futures.append(executor.submit(receive_mq2_data))
+        loop = asyncio.get_event_loop()
         for camera_id, url in enumerate(ESP32_CAM_URLS, start=1):
-            futures.append(executor.submit(capture_and_process_frames, camera_id, url))
-        for future in as_completed(futures):
-            future.result()
+            futures.append(loop.run_in_executor(executor, capture_and_process_frames, camera_id, url))
+        await asyncio.gather(*futures)
+
+if __name__ == '__main__':
+    asyncio.run(main())
